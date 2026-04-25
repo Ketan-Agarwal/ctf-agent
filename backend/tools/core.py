@@ -193,7 +193,7 @@ def _has_valid_magic(data: bytes, mime_type: str) -> bool:
 
 
 async def do_view_image(sandbox, filename: str, use_vision: bool) -> tuple[bytes, str] | str:
-    """Returns (image_bytes, media_type) on success, or error string."""
+    """Returns (image_bytes, media_type) for vision models, VLM text description otherwise, or error string."""
     # Strip leading path if model passes full container path
     basename = Path(filename).name
     ext = Path(basename).suffix.lower()
@@ -201,31 +201,39 @@ async def do_view_image(sandbox, filename: str, use_vision: bool) -> tuple[bytes
     if not mime_type:
         return f"Not a supported image type: {filename}"
 
-    if not use_vision:
-        return "Vision not available for this model. Use bash tools (steghide, zsteg, exiftool, strings) instead."
-
     # Try the filename as-is first (if it's an absolute path), then search standard dirs
     search_paths = []
     if filename.startswith("/"):
         search_paths.append(filename)
     search_paths.extend([f"/challenge/distfiles/{basename}", f"/challenge/workspace/{basename}"])
 
+    data: bytes | None = None
     for path in search_paths:
         try:
             data = await sandbox.read_file_bytes(path)
-            if not _has_valid_magic(data, mime_type):
-                return (
-                    "Cannot load image: file appears invalid or corrupted. "
-                    "Fix the magic bytes in the sandbox first, save to /challenge/workspace/, "
-                    "then call view_image again."
-                )
-            if len(data) > MAX_IMAGE_BYTES:
-                return (
-                    f"Image too large for vision ({len(data) / 1024 / 1024:.1f} MB > 4 MB limit). "
-                    "Use bash tools (steghide, zsteg, binwalk, exiftool, strings, xxd) instead."
-                )
-            return (data, mime_type)
+            break
         except Exception:
             continue
 
-    return f"File not found: {filename} (searched: {', '.join(search_paths)})"
+    if data is None:
+        return f"File not found: {filename} (searched: {', '.join(search_paths)})"
+
+    if not _has_valid_magic(data, mime_type):
+        return (
+            "Cannot load image: file appears invalid or corrupted. "
+            "Fix the magic bytes in the sandbox first, save to /challenge/workspace/, "
+            "then call view_image again."
+        )
+    # if len(data) > MAX_IMAGE_BYTES:
+    #     return (
+    #         f"Image too large for vision ({len(data) / 1024 / 1024:.1f} MB > 4 MB limit). "
+    #         "Use bash tools (steghide, zsteg, binwalk, exiftool, strings, xxd) instead."
+    #     )
+
+    # Vision-capable models: return raw image bytes for native multimodal input
+    if use_vision:
+        return (data, mime_type)
+
+    # Non-vision models: use Gemini VLM sidecar to describe the image
+    from backend.tools.vlm import describe_image
+    return await describe_image(data, mime_type)

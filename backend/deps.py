@@ -47,11 +47,15 @@ class CoordinatorDeps:
 
     msg_port: int = 0  # 0 = auto-pick free port
 
+    # HITL gate — auto-approves when disabled
+    hitl_gate: Any = None  # HITLGate, typed as Any to avoid circular import
+
     # Runtime state
     coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
     operator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
     swarms: dict[str, Any] = field(default_factory=dict)
     swarm_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     results: dict[str, dict] = field(default_factory=dict)
+    denied_spawns: set[str] = field(default_factory=set)  # challenges operator rejected
     challenge_dirs: dict[str, str] = field(default_factory=dict)
     challenge_metas: dict[str, Any] = field(default_factory=dict)

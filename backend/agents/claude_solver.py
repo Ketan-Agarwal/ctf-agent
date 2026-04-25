@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shlex
 import time
@@ -38,6 +39,22 @@ logger = logging.getLogger(__name__)
 
 class ClaudeSolver:
     """Claude Agent SDK solver using native tools redirected to Docker sandbox."""
+
+    # Class-level counter for round-robin key selection
+    _key_counter: int = 0
+
+    @classmethod
+    def _pick_api_key(cls) -> str:
+        """Round-robin between available Anthropic API keys."""
+        keys = [k for k in (
+            os.environ.get("ANTHROPIC_API_KEY", ""),
+            os.environ.get("ANTHROPIC_API_KEY_2", ""),
+        ) if k]
+        if not keys:
+            return ""
+        key = keys[cls._key_counter % len(keys)]
+        cls._key_counter += 1
+        return key
 
     def __init__(
         self,
@@ -76,6 +93,10 @@ class ClaudeSolver:
         self.agent_name = f"{meta.name}/{self.model_id}"
 
         self._client: ClaudeSDKClient | None = None
+        self._selected_key = self._pick_api_key()
+        if self._selected_key:
+            suffix = self._selected_key[-6:]
+            logger.debug(f"[{self.agent_name}] Using API key ...{suffix}")
         self._session_id: str | None = None
         self._container_id: str = ""
         self._step_count = 0
@@ -258,7 +279,11 @@ class ClaudeSolver:
             system_prompt=system_prompt,
             effort=effort,
             # Clear CLAUDECODE to prevent nested-session rejection when run from coordinator
-            env={"CLAUDECODE": ""},
+            # Round-robin between available Anthropic API keys
+            env={
+                "CLAUDECODE": "",
+                **({"ANTHROPIC_API_KEY": self._selected_key} if self._selected_key else {}),
+            },
             allowed_tools=["Bash", "WebFetch", "WebSearch"],
             permission_mode="bypassPermissions",
             output_format={"type": "json_schema", "schema": solver_output_json_schema()},
@@ -299,7 +324,22 @@ class ClaudeSolver:
             else:
                 prompt = "Solve this CTF challenge."
 
-            await self._client.query(prompt)
+            try:
+                await self._client.query(prompt)
+            except Exception as conn_err:
+                if "terminated" in str(conn_err).lower() or "connection" in str(conn_err).lower():
+                    # SDK subprocess died after last turn — re-create client
+                    logger.info(f"[{self.agent_name}] Re-creating SDK client (subprocess exited)")
+                    try:
+                        await self._client.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    self._client = None
+                    await self.start()
+                    assert self._client is not None
+                    await self._client.query(prompt)
+                else:
+                    raise
 
             async for message in self._client.receive_response():
                 if self.cancel_event.is_set():

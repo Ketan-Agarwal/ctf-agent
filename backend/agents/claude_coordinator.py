@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from claude_agent_sdk import (
@@ -149,7 +150,12 @@ async def run_claude_coordinator(
     options = ClaudeAgentOptions(
         model=resolved_model,
         system_prompt=COORDINATOR_PROMPT,
-        env={"CLAUDECODE": ""},
+        env={
+            "CLAUDECODE": "",
+            **({
+                "ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"]
+            } if os.environ.get("ANTHROPIC_API_KEY") else {}),
+        },
         mcp_servers={"coordinator": mcp_server},
         allowed_tools=list(allowed),
         permission_mode="bypassPermissions",
@@ -158,20 +164,54 @@ async def run_claude_coordinator(
         },
     )
 
-    async with ClaudeSDKClient(options=options) as client:
-        async def turn_fn(msg: str) -> None:
-            logger.debug(f"Coordinator query: {msg[:200]}")
-            await client.query(msg)
-            msg_count = 0
-            async for message in client.receive_response():
-                msg_count += 1
-                msg_type = type(message).__name__
-                logger.debug(f"Coordinator received: {msg_type}")
-                if isinstance(message, ResultMessage):
-                    cost = getattr(message, "total_cost_usd", 0)
-                    session = getattr(message, "session_id", None)
-                    logger.info(f"Claude coordinator turn done (messages={msg_count}, cost=${cost:.4f}, session={session})")
-            if msg_count == 0:
-                logger.warning("Coordinator turn produced no messages!")
+    # Use a mutable holder so turn_fn can re-create the client when the
+    # subprocess exits between turns (common Claude SDK behaviour).
+    client_holder: list[ClaudeSDKClient | None] = [None]
 
+    async def _make_client() -> ClaudeSDKClient:
+        c = ClaudeSDKClient(options=options)
+        await c.__aenter__()
+        return c
+
+    async def _teardown(c: ClaudeSDKClient | None) -> None:
+        if c is None:
+            return
+        try:
+            await c.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    async def turn_fn(msg: str) -> None:
+        if client_holder[0] is None:
+            client_holder[0] = await _make_client()
+        client = client_holder[0]
+
+        logger.debug(f"Coordinator query: {msg[:200]}")
+        try:
+            await client.query(msg)
+        except Exception as conn_err:
+            if "terminated" in str(conn_err).lower() or "connection" in str(conn_err).lower():
+                logger.info("Coordinator re-creating SDK client (subprocess exited)")
+                await _teardown(client)
+                client = await _make_client()
+                client_holder[0] = client
+                await client.query(msg)
+            else:
+                raise
+
+        msg_count = 0
+        async for message in client.receive_response():
+            msg_count += 1
+            msg_type = type(message).__name__
+            logger.debug(f"Coordinator received: {msg_type}")
+            if isinstance(message, ResultMessage):
+                cost = getattr(message, "total_cost_usd", 0)
+                session = getattr(message, "session_id", None)
+                logger.info(f"Claude coordinator turn done (messages={msg_count}, cost=${cost:.4f}, session={session})")
+        if msg_count == 0:
+            logger.warning("Coordinator turn produced no messages!")
+
+    try:
         return await run_event_loop(deps, ctfd, cost_tracker, turn_fn)
+    finally:
+        await _teardown(client_holder[0])

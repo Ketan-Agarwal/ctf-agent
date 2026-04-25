@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import click
 from rich.console import Console
 
 from backend.config import Settings
-from backend.models import DEFAULT_MODELS
+from backend.models import DEFAULT_MODELS, FULL_MODELS
 
 console = Console()
 
@@ -32,7 +33,8 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--ctfd-url", default=None, help="CTFd URL (overrides .env)")
 @click.option("--ctfd-token", default=None, help="CTFd API token (overrides .env)")
 @click.option("--image", default="ctf-sandbox", help="Docker sandbox image name")
-@click.option("--models", multiple=True, help="Model specs (default: all configured)")
+@click.option("--models", multiple=True, help="Model specs (default: Claude + Gemini)")
+@click.option("--full-models", "use_full_models", is_flag=True, help="Use all models (requires GPT subscription)")
 @click.option("--challenge", default=None, help="Solve a single challenge directory")
 @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
 @click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
@@ -40,12 +42,16 @@ def _setup_logging(verbose: bool = False) -> None:
 @click.option("--coordinator", default="claude", type=click.Choice(["claude", "codex"]), help="Coordinator backend")
 @click.option("--max-challenges", default=10, type=int, help="Max challenges solved concurrently")
 @click.option("--msg-port", default=0, type=int, help="Operator message port (0 = auto)")
+@click.option("--hitl", is_flag=True, help="Enable human-in-the-loop approval gates")
+@click.option("--cost-limit", default=50.0, type=float, help="Global cost limit in USD")
+@click.option("--challenge-cost-limit", default=5.0, type=float, help="Per-challenge cost limit in USD")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
     ctfd_url: str | None,
     ctfd_token: str | None,
     image: str,
     models: tuple[str, ...],
+    use_full_models: bool,
     challenge: str | None,
     challenges_dir: str,
     no_submit: bool,
@@ -53,6 +59,9 @@ def main(
     coordinator: str,
     max_challenges: int,
     msg_port: int,
+    hitl: bool,
+    cost_limit: float,
+    challenge_cost_limit: float,
     verbose: bool,
 ) -> None:
     """CTF Agent — multi-model solver swarm.
@@ -62,19 +71,36 @@ def main(
     _setup_logging(verbose)
 
     settings = Settings(sandbox_image=image)
+    # Export API keys to os.environ so subprocess-based SDKs (Claude SDK, etc.) can find them.
+    # pydantic-settings reads .env into the Settings object but doesn't set os.environ.
+    for env_key in ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_2", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+        val = getattr(settings, env_key.lower(), "")
+        if val and not os.environ.get(env_key):
+            os.environ[env_key] = val
     if ctfd_url:
         settings.ctfd_url = ctfd_url
     if ctfd_token:
         settings.ctfd_token = ctfd_token
     settings.max_concurrent_challenges = max_challenges
+    settings.hitl = hitl
+    settings.cost_limit_global = cost_limit
+    settings.cost_limit_per_challenge = challenge_cost_limit
 
-    model_specs = list(models) if models else list(DEFAULT_MODELS)
+    if models:
+        model_specs = list(models)
+    elif use_full_models:
+        model_specs = list(FULL_MODELS)
+    else:
+        model_specs = list(DEFAULT_MODELS)
 
     console.print("[bold]CTF Agent v2[/bold]")
     console.print(f"  CTFd: {settings.ctfd_url}")
     console.print(f"  Models: {', '.join(model_specs)}")
     console.print(f"  Image: {settings.sandbox_image}")
     console.print(f"  Max challenges: {max_challenges}")
+    if hitl:
+        console.print("  [yellow]HITL: enabled[/yellow]")
+    console.print(f"  Cost limits: ${challenge_cost_limit}/challenge, ${cost_limit} global")
     console.print()
 
     if challenge:
@@ -94,6 +120,7 @@ async def _run_single(
     from backend.agents.swarm import ChallengeSwarm
     from backend.cost_tracker import CostTracker
     from backend.ctfd import CTFdClient
+    from backend.hitl import HITLGate
     from backend.prompts import ChallengeMeta
     from backend.sandbox import cleanup_orphan_containers, configure_semaphore
 
@@ -117,6 +144,7 @@ async def _run_single(
         password=settings.ctfd_pass,
     )
     cost_tracker = CostTracker()
+    gate = HITLGate(enabled=settings.hitl)
 
     swarm = ChallengeSwarm(
         challenge_dir=str(challenge_path),
@@ -126,6 +154,9 @@ async def _run_single(
         settings=settings,
         model_specs=model_specs,
         no_submit=no_submit,
+        hitl_gate=gate,
+        max_bumps=settings.max_bumps_per_solver,
+        cost_limit=settings.cost_limit_per_challenge,
     )
 
     try:
@@ -209,6 +240,34 @@ def msg(message: str, port: int, host: str) -> None:
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
             console.print(f"[green]Sent:[/green] {data.get('queued', message[:200])}")
+    except Exception as e:
+        console.print(f"[red]Failed:[/red] {e}")
+        console.print("Is the coordinator running?")
+        sys.exit(1)
+
+
+@click.command()
+@click.argument("hint")
+@click.option("--challenge", "-c", required=True, help="Challenge name to inject hint into")
+@click.option("--port", default=9400, type=int, help="Coordinator message port")
+@click.option("--host", default="127.0.0.1", help="Coordinator host")
+def inject(hint: str, challenge: str, port: int, host: str) -> None:
+    """Inject a hint directly into a running solver's message bus."""
+    import json
+    import urllib.request
+
+    body = json.dumps({"challenge": challenge, "message": hint}).encode()
+    req = urllib.request.Request(
+        f"http://{host}:{port}/inject",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            result = data.get("result", "")
+            console.print(f"[green]✅ {result}[/green]")
     except Exception as e:
         console.print(f"[red]Failed:[/red] {e}")
         console.print("Is the coordinator running?")

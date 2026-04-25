@@ -215,7 +215,7 @@ class CodexSolver:
             "cwd": "/challenge",
             "approvalPolicy": "on-request",
             "sandbox": "read-only",
-            "serviceTier": "flex",
+            "serviceTier": "fast",
             "dynamicTools": SANDBOX_TOOLS,
         }
         # Reasoning effort for models that support it

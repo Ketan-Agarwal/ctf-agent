@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     # API Keys
     anthropic_api_key: str = ""
+    anthropic_api_key_2: str = ""  # optional second key for round-robin
     openai_api_key: str = ""
     gemini_api_key: str = ""
 
@@ -29,5 +30,11 @@ class Settings(BaseSettings):
     max_concurrent_challenges: int = 10
     max_attempts_per_challenge: int = 3
     container_memory_limit: str = "16g"
+
+    # HITL (Human-in-the-Loop)
+    hitl: bool = False
+    cost_limit_per_challenge: float = 5.0  # USD, per challenge
+    cost_limit_global: float = 50.0  # USD, total
+    max_bumps_per_solver: int = 5
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

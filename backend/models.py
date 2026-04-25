@@ -17,13 +17,21 @@ from pydantic_ai.settings import ModelSettings
 if TYPE_CHECKING:
     from backend.config import Settings
 
-# Default model specs — claude-sdk and codex providers use the new solver backends
+# Default model specs — only models with active subscriptions
 DEFAULT_MODELS: list[str] = [
+    "claude-sdk/claude-opus-4-6/medium",
+    # "codex/gpt-5.4",
+    # "google/gemini-3-flash-preview",
+]
+
+# Full model specs — requires GPT subscription too
+FULL_MODELS: list[str] = [
     "claude-sdk/claude-opus-4-6/medium",
     "claude-sdk/claude-opus-4-6/max",
     "codex/gpt-5.4",
     "codex/gpt-5.4-mini",
     "codex/gpt-5.3-codex",
+    "google/gemini-3-flash-preview",
 ]
 
 # Context window sizes (tokens)
@@ -39,11 +47,11 @@ CONTEXT_WINDOWS: dict[str, int] = {
 
 # Models that support vision
 VISION_MODELS: set[str] = {
-    "us.anthropic.claude-opus-4-6-v1",
-    "claude-opus-4-6",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gemini-3-flash-preview",
+    # "us.anthropic.claude-opus-4-6-v1",
+    # "claude-opus-4-6",
+    # "gpt-5.4",
+    # "gpt-5.4-mini",
+    # "gemini-3-flash-preview",
 }
 
 

@@ -5,17 +5,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
+import time
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import IntPrompt, Prompt
 
 from backend.config import Settings
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
 from backend.deps import CoordinatorDeps
+from backend.hitl import HITLGate, _suppress_stream_handlers, _restore_stream_handlers
 from backend.models import DEFAULT_MODELS
 from backend.poller import CTFdPoller
 from backend.prompts import ChallengeMeta
+
+_console = Console()
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +61,7 @@ def build_deps(
         max_concurrent_challenges=getattr(settings, "max_concurrent_challenges", 10),
         challenge_dirs=challenge_dirs or {},
         challenge_metas=challenge_metas or {},
+        hitl_gate=HITLGate(enabled=getattr(settings, "hitl", False)),
     )
 
     # Pre-load already-pulled challenges
@@ -86,7 +96,7 @@ async def run_event_loop(
     await poller.start()
 
     # Start operator message HTTP endpoint
-    msg_server = await _start_msg_server(deps.operator_inbox, deps.msg_port)
+    msg_server = await _start_msg_server(deps.operator_inbox, deps, deps.msg_port)
 
     logger.info(
         "Coordinator starting: %d models, %d challenges, %d solved",
@@ -103,6 +113,22 @@ async def run_event_loop(
         "Fetch challenges and spawn swarms for all unsolved."
     )
 
+    # Ctrl+C injection state
+    inject_requested = False
+    last_sigint_time = 0.0
+
+    def _sigint_handler(sig, frame):
+        nonlocal inject_requested, last_sigint_time
+        now = time.monotonic()
+        if now - last_sigint_time < 2.0:
+            # Double Ctrl+C within 2s → real shutdown
+            raise KeyboardInterrupt
+        last_sigint_time = now
+        inject_requested = True
+
+    original_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     try:
         await turn_fn(initial_msg)
 
@@ -112,6 +138,11 @@ async def run_event_loop(
         last_status = asyncio.get_event_loop().time()
 
         while True:
+            # ---- Ctrl+C inject prompt ----
+            if inject_requested:
+                inject_requested = False
+                await _interactive_inject(deps)
+
             events = []
             evt = await poller.get_event(timeout=5.0)
             if evt:
@@ -182,6 +213,8 @@ async def run_event_loop(
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Coordinator shutting down...")
+    except _InjectShutdown:
+        logger.info("Coordinator shutting down (from inject prompt)...")
     except Exception as e:
         logger.error("Coordinator fatal: %s", e, exc_info=True)
     finally:
@@ -196,6 +229,7 @@ async def run_event_loop(
         if deps.swarm_tasks:
             await asyncio.gather(*deps.swarm_tasks.values(), return_exceptions=True)
         cost_tracker.log_summary()
+        signal.signal(signal.SIGINT, original_handler)
         try:
             await ctfd.close()
         except Exception:
@@ -208,12 +242,99 @@ async def run_event_loop(
     }
 
 
+class _InjectShutdown(Exception):
+    """Raised from inject prompt when user wants to quit."""
+
+
+async def _inject_into_challenge(deps: CoordinatorDeps, challenge_name: str, hint: str) -> str:
+    """Broadcast an operator hint into a challenge's message bus."""
+    swarm = deps.swarms.get(challenge_name)
+    if not swarm:
+        return f"No active swarm for '{challenge_name}'"
+    await swarm.message_bus.broadcast(
+        f"**🎯 OPERATOR HINT**: {hint}",
+        source="operator",
+    )
+    logger.info("Operator hint injected into %s: %s", challenge_name, hint[:200])
+    return f"Hint injected into {challenge_name}"
+
+
+def _interactive_inject_blocking(challenge_names: list[str]) -> tuple[str, str] | None:
+    """Blocking Rich prompt for inject — runs via asyncio.to_thread.
+
+    Returns (challenge_name, hint) or None if cancelled.
+    """
+    if not challenge_names:
+        _console.print("[red]No active swarms to inject into.[/red]")
+        return None
+
+    # Build numbered list
+    lines = []
+    for i, name in enumerate(challenge_names, 1):
+        lines.append(f"  [bold][{i}][/bold] {name}")
+    panel = Panel(
+        "\n".join(lines),
+        title="[magenta]💉 Inject Hint (Ctrl+C again to quit)[/magenta]",
+        border_style="magenta",
+    )
+    _console.print()
+    _console.print(panel)
+
+    try:
+        if len(challenge_names) == 1:
+            choice = 1
+            _console.print(f"  Auto-selected: [bold]{challenge_names[0]}[/bold]")
+        else:
+            choice = IntPrompt.ask(
+                "[magenta]Select challenge[/magenta]",
+                choices=[str(i) for i in range(1, len(challenge_names) + 1)],
+            )
+        challenge = challenge_names[choice - 1]
+        hint = Prompt.ask(f"[magenta]Hint for {challenge}[/magenta]")
+        if not hint.strip():
+            _console.print("[yellow]Empty hint — cancelled.[/yellow]")
+            return None
+        return challenge, hint
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+
+async def _interactive_inject(deps: CoordinatorDeps) -> None:
+    """Show interactive inject prompt (triggered by Ctrl+C)."""
+    active = [
+        name for name, swarm in deps.swarms.items()
+        if not swarm.cancel_event.is_set()
+    ]
+    saved = _suppress_stream_handlers()
+    try:
+        result = await asyncio.to_thread(_interactive_inject_blocking, active)
+    except KeyboardInterrupt:
+        _restore_stream_handlers(saved)
+        raise _InjectShutdown()
+    finally:
+        _restore_stream_handlers(saved)
+
+    if result:
+        challenge_name, hint = result
+        msg = await _inject_into_challenge(deps, challenge_name, hint)
+        _console.print(f"[green]✅ {msg}[/green]\n")
+
+
 async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
     """Auto-spawn a swarm for a single challenge if not already running."""
     if challenge_name in deps.swarms:
         return
+    if challenge_name in deps.denied_spawns:
+        return
     active = sum(1 for t in deps.swarm_tasks.values() if not t.done())
     if active >= deps.max_concurrent_challenges:
+        return
+    # Global cost cap — don't spawn new challenges if budget is exhausted
+    cost_limit = getattr(deps.settings, "cost_limit_global", 50.0)
+    if deps.cost_tracker.total_cost_usd >= cost_limit:
+        logger.warning(
+            f"Global cost limit ${cost_limit:.2f} reached (${deps.cost_tracker.total_cost_usd:.2f} spent) — not spawning {challenge_name}"
+        )
         return
     try:
         from backend.agents.coordinator_core import do_spawn_swarm
@@ -229,9 +350,16 @@ async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
     for name in sorted(unsolved):
         await _auto_spawn_one(deps, name)
 
+async def _start_msg_server(
+    inbox: asyncio.Queue,
+    deps: CoordinatorDeps,
+    port: int = 0,
+) -> asyncio.Server | None:
+    """Start a tiny HTTP server that accepts operator messages and hint injections.
 
-async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Server | None:
-    """Start a tiny HTTP server that accepts operator messages via POST."""
+    POST /msg     {"message": "..."}                     → operator inbox (coordinator)
+    POST /inject  {"challenge": "...", "message": "..."}  → solver message bus (direct)
+    """
 
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -246,23 +374,41 @@ async def _start_msg_server(inbox: asyncio.Queue, port: int = 0) -> asyncio.Serv
                     k, v = line.decode().split(":", 1)
                     headers[k.strip().lower()] = v.strip()
 
-            method = request_line.decode().split()[0] if request_line else ""
+            decoded = request_line.decode() if request_line else ""
+            parts = decoded.split()
+            method = parts[0] if parts else ""
+            path = parts[1] if len(parts) > 1 else "/"
             content_length = int(headers.get("content-length", 0))
 
-            if method == "POST" and content_length > 0:
-                body = await asyncio.wait_for(reader.read(content_length), timeout=5)
-                try:
-                    data = json.loads(body)
-                    message = data.get("message", body.decode())
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    message = body.decode("utf-8", errors="replace")
+            if method != "POST" or content_length <= 0:
+                resp = json.dumps({"error": "POST with JSON body required"})
+                writer.write(f"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
+                await writer.drain()
+                return
 
+            body = await asyncio.wait_for(reader.read(content_length), timeout=5)
+            try:
+                data = json.loads(body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {"message": body.decode("utf-8", errors="replace")}
+
+            if path.rstrip("/") == "/inject":
+                # Direct solver injection
+                challenge = data.get("challenge", "")
+                message = data.get("message", "")
+                if not challenge or not message:
+                    resp = json.dumps({"error": "Both 'challenge' and 'message' required"})
+                    writer.write(f"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
+                else:
+                    result = await _inject_into_challenge(deps, challenge, message)
+                    resp = json.dumps({"ok": True, "result": result})
+                    writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
+            else:
+                # Default: operator message to coordinator
+                message = data.get("message", json.dumps(data))
                 inbox.put_nowait(message)
                 resp = json.dumps({"ok": True, "queued": message[:200]})
                 writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
-            else:
-                resp = json.dumps({"error": "POST with JSON body required", "usage": "POST {\"message\": \"...\"}"})
-                writer.write(f"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {len(resp)}\r\n\r\n{resp}".encode())
 
             await writer.drain()
         except Exception:

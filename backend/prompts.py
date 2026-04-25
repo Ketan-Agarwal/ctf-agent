@@ -92,7 +92,11 @@ def build_prompt(
     if meta.tags:
         lines.append(f"**Tags**    : {', '.join(meta.tags)}")
     lines += ["", "## Description", meta.description or "_No description provided._", ""]
-
+    if meta.description:
+        lines += [
+            "> **CRITICAL CONSTRAINT CHECK**: Read the description above carefully. If it explicitly states what the challenge is NOT about (e.g., 'not steganography', 'no LSB'), you are STRICTLY FORBIDDEN from using tools or spending time on those vectors.",
+            ""
+        ]
     if conn_info:
         if re.match(r"^https?://", conn_info):
             hint = "This is a **web service**. Use `bash` with `curl`/`python3 requests`, or use `web_fetch`."
@@ -163,7 +167,9 @@ def build_prompt(
         "",
         "1. " + ("Connect to the service now." if conn_info else "Inspect distfiles now."),
         "2. Keep using tools until you have the flag.",
-        "3. **Be creative and thorough** — try the obvious path, then explore further:",
+        "3. **Maintain a Clue Board:** If you extract a suspicious string, a hex payload, or unique metadata, explicitly write it to a 'Clue Board' in your output.",
+        "4. **Cross-Reference State:** Before moving to a new domain (e.g., switching from forensics to audio analysis), you MUST review your Clue Board. Ask yourself: 'Can I combine these disparate clues (e.g., XORing this payload with this string)?'",
+        "5. **Be creative and thorough** — try the obvious path, then explore further:",
         "   - Hidden files, env vars, backup files, HTTP headers, error messages, timing, encoding tricks.",
         f"   - {image_hint}",
         f"   - {web_hint}",
@@ -172,10 +178,10 @@ def build_prompt(
             "For RSA: use `RsaCtfTool`, sage ECM, or `cado-nfs`."
         ),
         "   - Pwn: `stty raw -echo` before launching vulnerable binaries over nc.",
-        '4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
-        f"5. {submit_hint}",
-        "6. Once CORRECT: output `FLAG: <value>` on its own line.",
-        "7. Do not guess. Do not ask. Cover maximum surface area.",
+        '6. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
+        f"7. {submit_hint}",
+        "8. Once CORRECT: output `FLAG: <value>` on its own line.",
+        "9. Do not guess. Do not ask. Cover maximum surface area.",
     ]
 
     return "\n".join(lines)

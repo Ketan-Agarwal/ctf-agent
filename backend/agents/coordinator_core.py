@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 
 from backend.deps import CoordinatorDeps
+from backend.hitl import HITLGate
 from backend.prompts import ChallengeMeta
 from backend.solver_base import FLAG_FOUND
 
@@ -68,15 +69,30 @@ async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
 
     from backend.agents.swarm import ChallengeSwarm
 
+    # HITL: ask before spawning (skip if already denied)
+    gate = deps.hitl_gate or HITLGate(enabled=False)
+    if challenge_name in deps.denied_spawns:
+        return f"Spawn for {challenge_name} was already rejected by operator. Use spawn_swarm again to retry."
+    meta = deps.challenge_metas[challenge_name]
+    approved = await gate.approve_spawn(
+        challenge_name, meta.category, meta.value, len(deps.model_specs),
+    )
+    if not approved:
+        deps.denied_spawns.add(challenge_name)
+        return f"Spawn for {challenge_name} rejected by operator."
+
     swarm = ChallengeSwarm(
         challenge_dir=deps.challenge_dirs[challenge_name],
-        meta=deps.challenge_metas[challenge_name],
+        meta=meta,
         ctfd=deps.ctfd,
         cost_tracker=deps.cost_tracker,
         settings=deps.settings,
         model_specs=deps.model_specs,
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
+        hitl_gate=gate,
+        max_bumps=getattr(deps.settings, "max_bumps_per_solver", 5),
+        cost_limit=getattr(deps.settings, "cost_limit_per_challenge", 5.0),
     )
     deps.swarms[challenge_name] = swarm
 

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from backend.agents.solver import Solver
 from backend.cost_tracker import CostTracker
 from backend.ctfd import CTFdClient
+from backend.hitl import HITLGate
 from backend.message_bus import ChallengeMessageBus
 from backend.models import DEFAULT_MODELS, provider_from_spec
 from backend.prompts import ChallengeMeta
@@ -55,6 +56,9 @@ class ChallengeSwarm:
     model_specs: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
     no_submit: bool = False
     coordinator_inbox: asyncio.Queue | None = None
+    hitl_gate: HITLGate = field(default_factory=HITLGate)
+    max_bumps: int = 5
+    cost_limit: float = 5.0  # per-challenge USD limit
 
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     solvers: dict[str, SolverProtocol] = field(default_factory=dict)
@@ -180,6 +184,14 @@ class ChallengeSwarm:
                         False,
                     )
 
+            # HITL: ask before submitting
+            cost_so_far = self.cost_tracker.total_cost_usd if self.cost_tracker else 0.0
+            approved = await self.hitl_gate.approve_flag_submit(
+                self.meta.name, normalized, model_spec, cost_so_far,
+            )
+            if not approved:
+                return "SKIPPED — human rejected flag submission.", False
+
             self._submitted_flags.add(normalized)
 
             from backend.tools.core import do_submit_flag
@@ -274,6 +286,35 @@ class ChallengeSwarm:
                     consecutive_errors = 0
 
                 bump_count += 1
+
+                # Hard cap on bumps
+                if bump_count > self.max_bumps:
+                    logger.info(
+                        f"[{self.meta.name}/{model_spec}] Max bumps ({self.max_bumps}) reached — stopping"
+                    )
+                    break
+
+                # Per-challenge cost cap check
+                challenge_cost = self.cost_tracker.total_cost_usd if self.cost_tracker else 0.0
+                if challenge_cost >= self.cost_limit:
+                    approved = await self.hitl_gate.approve_continue(
+                        self.meta.name, challenge_cost, self.cost_limit,
+                    )
+                    if not approved:
+                        logger.info(f"[{self.meta.name}/{model_spec}] Cost limit — human stopped")
+                        break
+
+                # HITL: ask before bumping (after 2+ bumps)
+                if bump_count >= 2:
+                    cost_so_far = self.cost_tracker.total_cost_usd if self.cost_tracker else 0.0
+                    findings = self.findings.get(model_spec, "")
+                    approved = await self.hitl_gate.approve_bump(
+                        self.meta.name, model_spec, bump_count, cost_so_far, findings,
+                    )
+                    if not approved:
+                        logger.info(f"[{self.meta.name}/{model_spec}] Bump rejected by human")
+                        break
+
                 # Cooldown between bumps — check cancellation during wait
                 try:
                     await asyncio.wait_for(
